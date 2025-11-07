@@ -1,6 +1,5 @@
-fastapi
-uvicorn
-python-multipart
+fastapi>=0.121
+uvicorn>=0.38
+python-multipart>=0.0.9
 itsdangerous>=2.1
-
-
+Pillow>=10.0
