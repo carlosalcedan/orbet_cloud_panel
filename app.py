@@ -287,7 +287,7 @@ a.muted {{ color:#9fb0d0; text-decoration:none; }}
       </div>
       <div class="right">
         <a class="btn" href="{url_for_with_query(request, desde=fmt_date(datetime.utcnow().date()), hasta=fmt_date(datetime.utcnow().date()), page=1)}">Hoy</a>
-        <a class="btn" href="{url_for_with_query(request, desde=fmt_date(datetime.utcnow().date()-timedelta(days=6)), hasta=fmt_date(datetime.utcnow().date()), page=1}">Últimos 7 días</a>
+        <a class="btn" href="{url_for_with_query(request, desde=fmt_date(datetime.utcnow().date()-timedelta(days=6)), hasta=fmt_date(datetime.utcnow().date()), page=1)}">Últimos 7 días</a>
         <a class="btn" href="/export_csv?{request.url.query}">⬇️ CSV</a>
         <a class="btn" href="/export_zip?{request.url.query}">⬇️ ZIP</a>
       </div>
