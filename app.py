@@ -1,409 +1,579 @@
-# app.py — ORBET CLOUD PANEL (auth + filtros + CSV + Paginación + ZIP + Guardado seguro)
-import os
-import io
-import csv
-import mimetypes
-import zipfile
-from datetime import datetime, timedelta
+# app.py — ORBET Cloud Panel: Login + /files protegido + /thumbs + Filtros + Paginación + CSV
+# Reqs: fastapi uvicorn python-multipart Pillow itsdangerous
+# Env en Render:
+#   SECRET_KEY     = <cadena larga aleatoria>
+#   USERS          = "admin:admin123,cliente:1234"
+#   ORBET_TOKEN    = "ORBET_2025_Seguridad_ARES"
+#   DATA_DIR       = "data"
+#   RETENTION_DAYS = "0"    # 0 = sin limpieza automática
+
+import os, io, csv, time, shutil
 from pathlib import Path
-from typing import List, Tuple, Optional
+from datetime import datetime, date
+from typing import Optional, List, Dict, Tuple
 
-from fastapi import FastAPI, Request, Depends, Form, UploadFile, File, Response, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, BackgroundTasks, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse, StreamingResponse
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.datastructures import URL
 
-# ========================= CONFIG =========================
-APP_TITLE = "ORBET – Galería"
-DEFAULT_TZ_OFFSET = -5  # solo para texto de ejemplo
+APP_NAME = "ORBET Cloud Panel"
 
-# Seguridad / sesión
-SESSION_SECRET = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
-ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
-
-# Raíz de subidas (persistente si montas /data en Render)
-UPLOAD_ROOT = Path(os.environ.get("UPLOAD_ROOT", "uploads")).resolve()
-CAPTURES_DIR = UPLOAD_ROOT / "capturas"
-TICKETS_DIR = UPLOAD_ROOT / "tickets"
-for d in (CAPTURES_DIR, TICKETS_DIR):
+# -------------------- Config --------------------
+ORBET_TOKEN = os.getenv("ORBET_TOKEN", "ORBET_2025_Seguridad_ARES")
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "0"))
+DATA_DIR = Path(os.getenv("DATA_DIR", "data")).resolve()
+CAP_DIR = DATA_DIR / "capturas"
+TIC_DIR = DATA_DIR / "tickets"
+for d in (CAP_DIR, TIC_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-# Token para /upload del detector
-ORBET_UPLOAD_TOKEN = os.environ.get("ORBET_CLOUD_TOKEN", "ORBET_2025_Seguridad_ARES")
+# Login
+SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret_in_render")
+USERS_ENV = os.getenv("USERS", "admin:admin123")  # "user:pass,user2:pass2"
+USERS: Dict[str,str] = {}
+for pair in USERS_ENV.split(","):
+    if ":" in pair:
+        u, p = pair.split(":", 1)
+        USERS[u.strip()] = p.strip()
 
-# Paginación
-DEFAULT_PAGE_SIZE = 24
-MAX_PAGE_SIZE = 100
+# -------------------- Utils --------------------
+def today_dir(kind: str) -> Path:
+    base = CAP_DIR if kind == "capturas" else TIC_DIR
+    day = datetime.now().strftime("%Y-%m-%d")
+    p = base / day
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-app = FastAPI(title=APP_TITLE)
-app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, same_site="lax")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
+def secure_name(name: str) -> str:
+    keep = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+    return "".join(c if c in keep else "_" for c in name)
 
-# ========================= Helpers =========================
-def is_logged(request: Request) -> bool:
-    return request.session.get("user") == ADMIN_USER
+def is_image(filename: str) -> bool:
+    return filename.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
 
-def login_required(request: Request):
-    if not is_logged(request):
-        raise HTTPException(status_code=401, detail="No autorizado")
-
-def parse_date(d: Optional[str]) -> Optional[datetime]:
-    if not d: 
-        return None
-    # admite "YYYY-MM-DD"
+def make_thumb(dest: Path):
+    """Genera miniatura JPG junto al archivo original (solo si es imagen)."""
+    if not is_image(dest.name):
+        return
     try:
-        return datetime.strptime(d, "%Y-%m-%d")
-    except ValueError:
-        return None
+        from PIL import Image
+        im = Image.open(dest)
+        im.thumbnail((480, 480))
+        thumb = dest.with_suffix(dest.suffix + ".thumb.jpg")
+        im.save(thumb, quality=80)
+    except Exception:
+        # no bloqueamos por errores de thumbnail
+        pass
 
-def list_daily_folders(root: Path) -> List[Path]:
-    if not root.exists():
-        return []
-    # directorios con nombre YYYY-MM-DD
-    items = [p for p in root.iterdir() if p.is_dir()]
-    items.sort(reverse=True)
+def cleanup_old(days: int):
+    if days <= 0: return
+    cutoff = time.time() - days * 86400
+    for base in (CAP_DIR, TIC_DIR):
+        for day_dir in base.iterdir():
+            if not day_dir.is_dir(): continue
+            try:
+                ts = time.mktime(time.strptime(day_dir.name, "%Y-%m-%d"))
+            except Exception:
+                continue
+            if ts < cutoff:
+                shutil.rmtree(day_dir, ignore_errors=True)
+
+def parse_ymd(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+def _category_from_name(name: str) -> str:
+    n = name.lower()
+    if "persona" in n: return "PERSONA"
+    if any(x in n for x in ("auto","car","vehic","truck","bus")): return "AUTO"
+    if any(x in n for x in ("animal","dog","cat","bird")): return "ANIMAL"
+    return "OTROS"
+
+def _iter_items(kind_dir: Path, start: Optional[date], end: Optional[date], qnorm: str):
+    """Iterador de archivos filtrados por día y query, renderea más tarde."""
+    for day_dir in sorted(kind_dir.iterdir(), reverse=True):
+        if not day_dir.is_dir(): 
+            continue
+        try:
+            d = parse_ymd(day_dir.name)
+        except Exception:
+            continue
+        if start and d < start: 
+            continue
+        if end and d > end: 
+            continue
+        for f in sorted(day_dir.iterdir(), reverse=True):
+            if not f.is_file(): 
+                continue
+            name = f.name
+            if qnorm:
+                cat = _category_from_name(name)
+                if (qnorm not in name.lower()) and (qnorm not in cat.lower()):
+                    continue
+            yield (d, day_dir.name, f)
+
+def list_items(kind: str, start: Optional[date], end: Optional[date], q: Optional[str]) -> List[Dict]:
+    base = CAP_DIR if kind == "capturas" else TIC_DIR
+    qnorm = (q or "").strip().lower()
+    items: List[Dict] = []
+    for d, day_str, f in _iter_items(base, start, end, qnorm):
+        name = f.name
+        items.append({
+            "date": d.isoformat(),
+            "name": name,
+            "url": f"/files/{kind}/{day_str}/{name}",
+            "thumb": f"/thumbs/{kind}/{day_str}/{name}",  # NUEVO: miniatura
+            "kind": kind,
+            "cat": _category_from_name(name),
+        })
     return items
 
-def collect_files(
-    root: Path,
-    date_from: Optional[datetime],
-    date_to: Optional[datetime],
-) -> List[Path]:
-    """
-    Recorre subcarpetas YYYY-MM-DD y junta los archivos dentro del rango.
-    """
-    out: List[Path] = []
-    for day_dir in list_daily_folders(root):
-        # intentar parsear fecha del folder
-        try:
-            fdate = datetime.strptime(day_dir.name, "%Y-%m-%d")
-        except ValueError:
-            continue
-        if date_from and fdate < date_from:
-            continue
-        if date_to and fdate > date_to:
-            continue
-        # agregar archivos (jpg/txt/lo que haya)
-        for f in sorted(day_dir.iterdir()):
-            if f.is_file():
-                out.append(f)
-    # orden descendente por mtime
-    out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return out
-
-def slice_page(items: List[Path], page: int, size: int) -> Tuple[List[Path], int]:
-    size = max(1, min(size, MAX_PAGE_SIZE))
+def paginate(items: List[Dict], page: int, size: int) -> Tuple[List[Dict], int]:
     total = len(items)
-    if total == 0:
-        return [], 0
-    pages = (total + size - 1) // size
-    page = max(1, min(page, pages))
+    if size <= 0: size = 50
+    if size > 200: size = 200
+    if page <= 0: page = 1
     start = (page - 1) * size
     end = start + size
-    return items[start:end], pages
+    return items[start:end], total
 
-def url_for_with_query(request: Request, **kwargs) -> str:
-    url = URL(str(request.url))
-    q = dict(request.query_params)
-    q.update({k: str(v) for k, v in kwargs.items() if v is not None})
-    return str(url.replace(query=q))
+# -------------------- App --------------------
+app = FastAPI(title=APP_NAME)
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=60*60*12)  # 12h
 
-def fmt_date(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d")
+@app.on_event("startup")
+def _on_start():
+    try: cleanup_old(RETENTION_DAYS)
+    except Exception: pass
 
-def guess_mimetype(path: Path) -> str:
-    t, _ = mimetypes.guess_type(path.name)
-    return t or "application/octet-stream"
+# -------------------- Auth helpers --------------------
+def current_user(req: Request) -> Optional[str]:
+    return req.session.get("user")
 
-# ========================= Auth =========================
-@app.get("/login", response_class=HTMLResponse)
-def login_form(request: Request):
-    if is_logged(request):
-        return RedirectResponse("/panel", status_code=302)
-    return HTMLResponse(f"""
-<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<title>Login – ORBET</title>
+def require_login(req: Request):
+    if not current_user(req):
+        raise HTTPException(status_code=401, detail="No autorizado")
+
+# -------------------- Login/Logout --------------------
+LOGIN_HTML = """
+<!doctype html><html lang="es"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Ingresar – ORBET</title>
 <style>
-body {{ background:#0b1320; color:#e5e7eb; font-family:system-ui, sans-serif; }}
-.card {{ max-width:360px; margin:8vh auto; background:#121a2a; padding:24px; border-radius:14px; box-shadow:0 10px 30px rgba(0,0,0,.35); }}
-h1 {{ font-size:22px; margin:0 0 16px; }}
-label {{ display:block; font-size:12px; opacity:.8; margin-top:10px; }}
-input {{ width:100%; padding:10px 12px; border-radius:10px; border:1px solid #273247; background:#0f172a; color:#e5e7eb; outline:none; }}
-button {{ margin-top:16px; width:100%; padding:10px; border-radius:10px; border:0; background:#2563eb; color:white; font-weight:600; cursor:pointer; }}
-small {{ display:block; margin-top:12px; opacity:.7; }}
-</style></head>
-<body>
-  <div class="card">
+body{background:#0f1220;color:#e7e7ee;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.card{background:#171a2b;border:1px solid #262a41;border-radius:16px;padding:22px;width:360px;box-shadow:0 6px 18px rgba(0,0,0,.25)}
+h1{font-size:20px;margin:0 0 12px}
+label{display:block;font-size:12px;opacity:.9;margin:8px 0 4px}
+input,button{width:100%;background:#0f1220;color:#e7e7ee;border:1px solid #2b3050;border-radius:10px;padding:10px}
+button{cursor:pointer;margin-top:10px}
+.msg{color:#ff9b9b;font-size:12px;margin:8px 0}
+</style>
+</head><body>
+  <form class="card" method="post" action="/login">
     <h1>ORBET – Ingresar</h1>
-    <form method="post" action="/login">
-      <label>Usuario</label>
-      <input name="username" autocomplete="username" required>
-      <label>Contraseña</label>
-      <input type="password" name="password" autocomplete="current-password" required>
-      <button>Entrar</button>
-    </form>
-    <small>Consejo: cambia la clave vía variables de entorno (ADMIN_USER / ADMIN_PASS).</small>
-  </div>
+    <label>Usuario</label>
+    <input name="username" autocomplete="username" required>
+    <label>Contraseña</label>
+    <input type="password" name="password" autocomplete="current-password" required>
+    <button type="submit">Entrar</button>
+    {msg}
+  </form>
 </body></html>
-""")
+"""
+
+@app.get("/login", response_class=HTMLResponse)
+def login_form():
+    return LOGIN_HTML.replace("{msg}","")
 
 @app.post("/login")
-def do_login(request: Request, username: str = Form(...), password: str = Form(...)):
-    if username == ADMIN_USER and password == ADMIN_PASS:
-        request.session["user"] = ADMIN_USER
-        return RedirectResponse("/panel", status_code=302)
-    return RedirectResponse("/login", status_code=302)
+def login(req: Request, username: str = Form(...), password: str = Form(...)):
+    if username in USERS and USERS[username] == password:
+        req.session["user"] = username
+        return RedirectResponse(url="/panel", status_code=302)
+    html = LOGIN_HTML.replace("{msg}", '<div class="msg">Usuario o contraseña inválidos</div>')
+    return HTMLResponse(html, status_code=401)
 
 @app.get("/logout")
-def do_logout(request: Request):
-    request.session.clear()
-    return RedirectResponse("/login", status_code=302)
+def logout(req: Request):
+    req.session.clear()
+    return RedirectResponse(url="/login", status_code=302)
 
-# ========================= Vistas =========================
-@app.get("/", response_class=HTMLResponse)
-def home(request: Request):
-    if not is_logged(request):
-        return RedirectResponse("/login", status_code=302)
-    return RedirectResponse("/panel", status_code=302)
+# -------------------- Health --------------------
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "service": APP_NAME}
 
-@app.get("/panel", response_class=HTMLResponse)
-def panel(
-    request: Request,
-    tipo: str = "capturas",        # "capturas" | "tickets"
-    desde: Optional[str] = None,   # "YYYY-MM-DD"
-    hasta: Optional[str] = None,   # "YYYY-MM-DD"
-    page: int = 1,
-    size: int = DEFAULT_PAGE_SIZE,
+# -------------------- Upload (token, no requiere login) --------------------
+@app.post("/upload")
+async def upload(
+    token: str = Form(...),
+    kind: str = Form(...),  # "captura" | "ticket"
+    file: UploadFile = File(...),
+    background: BackgroundTasks = None,
 ):
-    login_required(request)
+    if token != ORBET_TOKEN:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    if kind not in ("captura", "ticket"):
+        raise HTTPException(status_code=400, detail="kind debe ser 'captura' o 'ticket'")
 
-    # Rango por defecto = hoy
-    today = datetime.utcnow().date()
-    f_from = parse_date(desde) or datetime.combine(today, datetime.min.time())
-    f_to = parse_date(hasta) or datetime.combine(today, datetime.min.time())
+    target_dir = today_dir("capturas" if kind == "captura" else "tickets")
+    original = secure_name(file.filename or f"file_{int(time.time())}")
+    stamp = datetime.now().strftime("%H-%M-%S")
+    dest = target_dir / f"{stamp}_{original}"
 
-    root = CAPTURES_DIR if tipo == "capturas" else TICKETS_DIR
-    files = collect_files(root, f_from, f_to)
-    page_items, total_pages = slice_page(files, page, size)
+    data = await file.read()
+    with open(dest, "wb") as fh:
+        fh.write(data)
 
-    # Conteos rápidos (hoy)
-    cnt_caps = len(collect_files(CAPTURES_DIR, f_from, f_to))
-    cnt_ticks = len(collect_files(TICKETS_DIR, f_from, f_to))
+    # Miniatura en segundo plano (si es imagen)
+    if background: background.add_task(make_thumb, dest)
+    else: make_thumb(dest)
 
-    # Construcción del grid
-    cards = []
-    for p in page_items:
-        is_img = p.suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-        thumb = f"/files/{p.relative_to(UPLOAD_ROOT).as_posix()}"
-        fecha = p.parent.name
-        open_btn = f'<a href="{thumb}" target="_blank" class="btn">Abrir</a>'
-        if is_img:
-            cards.append(f"""
-<div class="card">
-  <img src="{thumb}" alt="">
-  <div class="meta">
-    <span>{fecha}</span>
-    {open_btn}
-  </div>
-</div>""")
-        else:
-            cards.append(f"""
-<div class="card">
-  <div class="file">{p.name}</div>
-  <div class="meta">
-    <span>{fecha}</span>
-    <a href="{thumb}" target="_blank" class="btn">Abrir</a>
-  </div>
-</div>""")
+    url = f"/files/{'capturas' if kind=='captura' else 'tickets'}/{target_dir.name}/{dest.name}"
+    return {"ok": True, "url": url, "name": dest.name}
 
-    # Navegación de páginas
-    prev_link = url_for_with_query(request, page=max(1, page-1))
-    next_link = url_for_with_query(request, page=min(total_pages or 1, page+1))
+# -------------------- /files protegido (requiere login) --------------------
+def _safe_path(kind: str, day: str, name: str) -> Path:
+    if kind not in ("capturas", "tickets"):
+        raise HTTPException(status_code=404, detail="No encontrado")
+    # evitar path traversal
+    day = secure_name(day)
+    name = secure_name(name)
+    base = CAP_DIR if kind == "capturas" else TIC_DIR
+    path = (base / day / name).resolve()
+    if not str(path).startswith(str(base.resolve())):
+        raise HTTPException(status_code=403, detail="Ruta inválida")
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="No encontrado")
+    return path
 
-    html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>{APP_TITLE}</title>
+@app.get("/files/{kind}/{day}/{name}")
+def get_file(req: Request, kind: str, day: str, name: str):
+    require_login(req)
+    path = _safe_path(kind, day, name)
+    media = "application/octet-stream"
+    if is_image(path.name):
+        media = "image/jpeg" if path.suffix.lower() in (".jpg",".jpeg") else "image/png"
+    return FileResponse(path, media_type=media)
+
+# -------------------- /thumbs protegido (sirve miniatura si existe, sino original) --------------------
+@app.get("/thumbs/{kind}/{day}/{name}")
+def get_thumb(req: Request, kind: str, day: str, name: str):
+    require_login(req)
+    path = _safe_path(kind, day, name)
+    if is_image(path.name):
+        thumb = path.with_suffix(path.suffix + ".thumb.jpg")
+        if thumb.exists():
+            return FileResponse(thumb, media_type="image/jpeg")
+    # fallback
+    media = "application/octet-stream"
+    if is_image(path.name):
+        media = "image/jpeg" if path.suffix.lower() in (".jpg",".jpeg") else "image/png"
+    return FileResponse(path, media_type=media)
+
+# -------------------- API list (requiere login) --------------------
+@app.get("/api/list", summary="Lista archivos con filtros de fecha, búsqueda y paginación")
+def api_list(
+    req: Request,
+    kind: str = Query("capturas", pattern="^(capturas|tickets)$"),
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    q: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    size: int = Query(60, ge=1, le=200),
+):
+    require_login(req)
+    s = parse_ymd(start) if start else None
+    e = parse_ymd(end) if end else None
+    items_all = list_items(kind, s, e, q)
+    items, total = paginate(items_all, page, size)
+    counts = {"PERSONA": 0, "AUTO": 0, "ANIMAL": 0, "OTROS": 0}
+    for it in items_all:
+        counts[it["cat"]] = counts.get(it["cat"], 0) + 1
+    return {
+        "ok": True,
+        "count": len(items),
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": (total + size - 1) // size if size else 1,
+        "items": items,
+        "counts": counts
+    }
+
+# -------------------- Export CSV (requiere login) --------------------
+@app.get("/api/export.csv")
+def export_csv(
+    req: Request,
+    kind: str = Query("capturas", pattern="^(capturas|tickets)$"),
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    q: Optional[str] = None,
+):
+    require_login(req)
+    s = parse_ymd(start) if start else None
+    e = parse_ymd(end) if end else None
+    items = list_items(kind, s, e, q)
+
+    def gen():
+        sio = io.StringIO()
+        writer = csv.writer(sio)
+        writer.writerow(["fecha", "tipo", "categoria", "nombre_archivo", "url"])
+        for it in items:
+            writer.writerow([it["date"], it["kind"], it["cat"], it["name"], it["url"]])
+        yield sio.getvalue()
+
+    headers = {"Content-Disposition": f'attachment; filename="orbet_{kind}.csv"'}
+    return StreamingResponse(gen(), headers=headers, media_type="text/csv; charset=utf-8")
+
+# -------------------- UI: vista rápida (requiere login) --------------------
+INDEX_HTML = """
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ORBET – Galería rápida</title>
 <style>
-:root {{ --bg:#0b1320; --panel:#0f172a; --muted:#8aa0c5; --text:#e5e7eb; --pri:#2563eb; }}
-* {{ box-sizing:border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--text); font-family:system-ui, sans-serif; }}
-.topbar {{ display:flex; gap:16px; align-items:center; padding:14px 18px; background:#0b1220; border-bottom:1px solid #1e293b; position:sticky; top:0; z-index:10; }}
-.brand {{ font-weight:800; letter-spacing:.2px; }}
-.badge {{ background:#1e293b; padding:4px 8px; border-radius:999px; font-size:12px; }}
-.container {{ max-width:1200px; margin:18px auto; padding:0 14px; }}
-.controls {{ display:flex; flex-wrap:wrap; gap:10px; align-items:end; margin-bottom:14px; }}
-select, input[type=date] {{ background:#0f172a; color:var(--text); border:1px solid #22314a; border-radius:10px; padding:8px 10px; }}
-button, .btn {{ background:var(--pri); color:white; border:0; border-radius:10px; padding:8px 12px; font-weight:600; text-decoration:none; cursor:pointer; }}
-.grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px; }}
-.card {{ background:var(--panel); border:1px solid #1e293b; border-radius:16px; overflow:hidden; }}
-.card img {{ width:100%; height:200px; object-fit:cover; display:block; }}
-.card .file {{ padding:20px; word-break:break-all; opacity:.9; }}
-.card .meta {{ display:flex; justify-content:space-between; align-items:center; padding:8px 12px 12px; }}
-.pager {{ display:flex; gap:8px; align-items:center; justify-content:center; margin:18px 0; }}
-a.muted {{ color:#9fb0d0; text-decoration:none; }}
-.right {{ margin-left:auto; display:flex; gap:8px; align-items:center; }}
+body{background:#0f1220;color:#e7e7ee;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:16px}
+.wrap{max-width:1100px;margin:auto}
+h1{font-size:22px;margin:0 0 12px}
+.card{background:#171a2b;border:1px solid #262a41;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 6px 18px rgba(0,0,0,.25)}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+select{background:#0f1220;color:#e7e7ee;border:1px solid #2b3050;border-radius:10px;padding:8px 10px}
+.badge{font-size:11px;background:#24305a;padding:4px 8px;border-radius:999px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.item{background:#11152a;border:1px solid #2a2f4a;border-radius:12px;padding:10px;opacity:0;transition:opacity .25s ease}
+.item.show{opacity:1}
+.item img{width:100%;display:block;border-radius:10px}
+.meta{font-size:12px;opacity:.85;margin-top:6px;display:flex;justify-content:space-between;gap:8px}
+a{color:#9ecbff}
+.right{margin-left:auto}
 </style>
 </head>
 <body>
-  <div class="topbar">
-    <div class="brand">ORBET – Panel</div>
-    <span class="badge">Capturas: {cnt_caps}</span>
-    <span class="badge">Tickets: {cnt_ticks}</span>
-    <div class="right">
-      <a class="muted" href="/logout">Salir</a>
+<div class="wrap">
+  <h1>ORBET – Galería en vivo <a class="right" href="/logout">Salir</a></h1>
+  <div class="card">
+    <div class="row">
+      <label>Tipo
+        <select id="kind">
+          <option value="capturas">Capturas</option>
+          <option value="tickets">Tickets</option>
+        </select>
+      </label>
+      <span id="count" class="badge">0</span>
+      <a href="/panel">Ir al Panel con filtros</a>
     </div>
   </div>
-
-  <div class="container">
-    <form class="controls" method="get" action="/panel">
-      <div>
-        <div style="font-size:12px;opacity:.8;">Tipo</div>
-        <select name="tipo">
-          <option value="capturas" {"selected" if tipo=="capturas" else ""}>Capturas</option>
-          <option value="tickets" {"selected" if tipo=="tickets" else ""}>Tickets</option>
-        </select>
-      </div>
-      <div>
-        <div style="font-size:12px;opacity:.8;">Desde</div>
-        <input type="date" name="desde" value="{fmt_date(f_from)}">
-      </div>
-      <div>
-        <div style="font-size:12px;opacity:.8;">Hasta</div>
-        <input type="date" name="hasta" value="{fmt_date(f_to)}">
-      </div>
-      <div>
-        <div style="font-size:12px;opacity:.8;">Tamaño</div>
-        <select name="size">
-          {"".join(f'<option value="{s}" {"selected" if s==size else ""}>{s}</option>' for s in (12,24,48,96))}
-        </select>
-      </div>
-      <div>
-        <button>Filtrar</button>
-      </div>
-      <div class="right">
-        <a class="btn" href="{url_for_with_query(request, desde=fmt_date(datetime.utcnow().date()), hasta=fmt_date(datetime.utcnow().date()), page=1)}">Hoy</a>
-        <a class="btn" href="{url_for_with_query(request, desde=fmt_date(datetime.utcnow().date()-timedelta(days=6)), hasta=fmt_date(datetime.utcnow().date()), page=1)}">Últimos 7 días</a>
-        <a class="btn" href="/export_csv?{request.url.query}">⬇️ CSV</a>
-        <a class="btn" href="/export_zip?{request.url.query}">⬇️ ZIP</a>
-      </div>
-    </form>
-
-    <div class="grid">
-      {"".join(cards) if cards else "<div style='opacity:.7'>Sin resultados.</div>"}
-    </div>
-
-    <div class="pager">
-      <a class="btn" href="{prev_link}">◀︎ Anterior</a>
-      <span>Página {page} de {total_pages or 1}</span>
-      <a class="btn" href="{next_link}">Siguiente ▶︎</a>
-    </div>
-  </div>
+  <div class="card"><div id="grid" class="grid"></div></div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const grid=$("#grid"), countEl=$("#count"), kind=$("#kind");
+const cardId=url=>"i_"+btoa(url).replace(/=/g,"");
+function ensureCard(it){
+  const id=cardId(it.url); let el=document.getElementById(id);
+  if(!el){
+    const isImg=/\\.(jpg|jpeg|png|gif|webp)$/i.test(it.name);
+    const thumbHtml=isImg?`<img loading="lazy" src="${it.thumb}" alt="${it.name}">`:`<div style="padding:20px;font-size:13px;opacity:.9">📄 ${it.name}</div>`;
+    el=document.createElement("div"); el.className="item"; el.id=id;
+    el.innerHTML=thumbHtml+`<div class="meta"><span>${it.date}</span><a class="badge" target="_blank" href="${it.url}">Abrir</a></div>`;
+    grid.prepend(el); requestAnimationFrame(()=>el.classList.add("show"));
+  }
+  return el;
+}
+function diffRender(items){
+  const want=new Set(items.map(it=>cardId(it.url)));
+  Array.from(grid.children).forEach(ch=>{ if(!want.has(ch.id)) ch.remove(); });
+  items.forEach(it=>ensureCard(it));
+  countEl.textContent=items.length;
+}
+async function load(){
+  const r=await fetch("/api/list?kind="+kind.value+"&page=1&size=60");
+  if(r.status==401){ location.href="/login"; return; }
+  const j=await r.json(); diffRender(j.items||[]);
+}
+kind.addEventListener("change", load);
+load(); setInterval(load, 5000);
+</script>
 </body></html>
 """
-    return HTMLResponse(html)
+@app.get("/", response_class=HTMLResponse)
+def index(req: Request):
+    require_login(req)
+    return INDEX_HTML
 
-# ========================= Descargas =========================
-@app.get("/export_csv")
-def export_csv(
-    request: Request,
-    tipo: str = "capturas",
-    desde: Optional[str] = None,
-    hasta: Optional[str] = None
-):
-    login_required(request)
-    f_from = parse_date(desde)
-    f_to = parse_date(hasta)
-    root = CAPTURES_DIR if tipo == "capturas" else TICKETS_DIR
-    files = collect_files(root, f_from, f_to)
+# -------------------- UI: Panel con filtros (requiere login) --------------------
+PANEL_HTML = """
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ORBET – Galería con filtros</title>
+<style>
+body{background:#0f1220;color:#e7e7ee;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:16px}
+.wrap{max-width:1200px;margin:auto}
+h1{font-size:26px;margin:0 0 14px}
+.card{background:#171a2b;border:1px solid #262a41;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 6px 18px rgba(0,0,0,.25)}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:end}
+.row label{display:flex;flex-direction:column;font-size:12px;opacity:.9}
+input,select,button{background:#0f1220;color:#e7e7ee;border:1px solid #2b3050;border-radius:10px;padding:8px 10px}
+button{cursor:pointer}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+.item{background:#11152a;border:1px solid #2a2f4a;border-radius:12px;padding:10px;opacity:0;transition:opacity .25s ease}
+.item.show{opacity:1}
+.item img{width:100%;display:block;border-radius:10px}
+.meta{font-size:12px;opacity:.85;margin-top:6px;display:flex;justify-content:space-between;gap:8px}
+.badge{font-size:11px;background:#24305a;padding:4px 8px;border-radius:999px}
+.stats{display:flex;gap:8px;flex-wrap:wrap}
+a{color:#9ecbff}
+.right{margin-left:auto}
+.pager{display:flex;gap:8px;align-items:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ORBET – Galería con filtros <a class="right" href="/logout">Salir</a></h1>
 
-    def gen():
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(["tipo", "fecha", "archivo", "ruta"])
-        yield buf.getvalue(); buf.seek(0); buf.truncate(0)
-        for p in files:
-            writer.writerow([tipo, p.parent.name, p.name, f"/files/{p.relative_to(UPLOAD_ROOT).as_posix()}"])
-            yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+  <div class="card">
+    <form id="f" class="row">
+      <label>Tipo
+        <select id="kind">
+          <option value="capturas">Capturas</option>
+          <option value="tickets">Tickets</option>
+        </select>
+      </label>
+      <label>Desde <input type="date" id="start"></label>
+      <label>Hasta <input type="date" id="end"></label>
+      <label>Buscar (nombre o categoría)
+        <input type="text" id="q" placeholder="persona / auto / animal / texto">
+      </label>
+      <label>Tamaño
+        <select id="size">
+          <option>30</option><option selected>60</option><option>100</option><option>150</option><option>200</option>
+        </select>
+      </label>
+      <button type="submit">Filtrar</button>
+      <button id="btnHoy">Hoy</button>
+      <button id="btn7">Últimos 7 días</button>
+      <label>Autorefresco
+        <select id="refreshSel">
+          <option value="0">Apagado</option>
+          <option value="30000">Cada 30 s</option>
+        </select>
+      </label>
+      <a href="/">Vista rápida</a>
+      <a id="dl" href="#" download>⬇️ CSV</a>
+      <span id="count" class="badge">0</span>
+    </form>
+  </div>
 
-    filename = f"orbet_{tipo}_{(desde or 'all')}_{(hasta or 'all')}.csv"
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return StreamingResponse(gen(), media_type="text/csv", headers=headers)
+  <div class="card">
+    <div class="stats">
+      <span class="badge" id="cP">PERSONA: 0</span>
+      <span class="badge" id="cA">AUTO: 0</span>
+      <span class="badge" id="cN">ANIMAL: 0</span>
+      <span class="badge" id="cO">OTROS: 0</span>
+      <span class="badge" id="total">TOTAL: 0</span>
+    </div>
+  </div>
 
-@app.get("/export_zip")
-def export_zip(
-    request: Request,
-    tipo: str = "capturas",
-    desde: Optional[str] = None,
-    hasta: Optional[str] = None
-):
-    login_required(request)
-    f_from = parse_date(desde)
-    f_to = parse_date(hasta)
-    root = CAPTURES_DIR if tipo == "capturas" else TICKETS_DIR
-    files = collect_files(root, f_from, f_to)
+  <div class="card">
+    <div class="pager">
+      <button id="prev">Anterior</button>
+      <span id="pageInfo">Página 1/1</span>
+      <button id="next">Siguiente</button>
+    </div>
+    <div id="grid" class="grid" style="margin-top:12px"></div>
+  </div>
+</div>
 
-    def stream():
-        mem = io.BytesIO()
-        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-            for p in files:
-                arcname = f"{p.parent.name}/{p.name}"
-                try:
-                    z.write(p, arcname=arcname)
-                except FileNotFoundError:
-                    continue
-        mem.seek(0)
-        yield mem.read()
+<script>
+const $=sel=>document.querySelector(sel);
+const grid=$("#grid"), countEl=$("#count");
+const kind=$("#kind"), start=$("#start"), end=$("#end"), q=$("#q"), sizeSel=$("#size");
+const cP=$("#cP"), cA=$("#cA"), cN=$("#cN"), cO=$("#cO"), totalEl=$("#total");
+const refreshSel=$("#refreshSel"); let timer=null;
+const dl=$("#dl"); const pageInfo=$("#pageInfo"), btnPrev=$("#prev"), btnNext=$("#next");
+let page=1, pages=1;
 
-    filename = f"orbet_{tipo}_{(desde or 'all')}_{(hasta or 'all')}.zip"
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return StreamingResponse(stream(), media_type="application/zip", headers=headers)
+const cardId=url=>"i_"+btoa(url).replace(/=/g,"");
 
-# ========================= Archivos protegidos =========================
-@app.get("/files/{path:path}")
-def serve_file(path: str, request: Request):
-    login_required(request)
-    full = (UPLOAD_ROOT / path).resolve()
-    if not str(full).startswith(str(UPLOAD_ROOT)) or not full.exists() or not full.is_file():
-        raise HTTPException(404, "No encontrado")
-    def fileiter():
-        with open(full, "rb") as f:
-            while chunk := f.read(1024 * 1024):
-                yield chunk
-    return StreamingResponse(fileiter(), media_type=guess_mimetype(full))
+function ensureCard(it){
+  const id=cardId(it.url); let el=document.getElementById(id);
+  if(!el){
+    const isImg=/\\.(jpg|jpeg|png|gif|webp)$/i.test(it.name);
+    const thumbHtml=isImg?`<img loading="lazy" src="${it.thumb}" alt="${it.name}">`:`<div style="padding:20px;font-size:13px;opacity:.9">📄 ${it.name}</div>`;
+    el=document.createElement("div"); el.className="item"; el.id=id;
+    el.innerHTML=thumbHtml+`<div class="meta"><span>${it.date}</span><a class="badge" target="_blank" href="${it.url}">Abrir</a></div>`;
+    grid.appendChild(el); requestAnimationFrame(()=>el.classList.add("show"));
+  }
+  return el;
+}
+function diffRender(items){
+  const want=new Set(items.map(it=>cardId(it.url)));
+  Array.from(grid.children).forEach(ch=>{ if(!want.has(ch.id)) ch.remove(); });
+  items.forEach(it=>ensureCard(it));
+  countEl.textContent=items.length;
+}
+function applyCounts(counts,total,p,ps){
+  cP.textContent="PERSONA: "+(counts["PERSONA"]||0);
+  cA.textContent="AUTO: "+(counts["AUTO"]||0);
+  cN.textContent="ANIMAL: "+(counts["ANIMAL"]||0);
+  cO.textContent="OTROS: "+(counts["OTROS"]||0);
+  totalEl.textContent="TOTAL: "+(total||0);
+  pageInfo.textContent="Página "+p+"/"+ps;
+  btnPrev.disabled = p<=1;
+  btnNext.disabled = p>=ps;
+}
+function buildParams(){
+  const p=new URLSearchParams();
+  p.set("kind", kind.value);
+  if(start.value) p.set("start", start.value);
+  if(end.value) p.set("end", end.value);
+  if(q.value.trim()) p.set("q", q.value.trim());
+  p.set("page", String(page));
+  p.set("size", String(sizeSel.value));
+  return p;
+}
+async function load(){
+  const r=await fetch("/api/list?"+buildParams().toString());
+  if(r.status==401){ location.href="/login"; return; }
+  const j=await r.json();
+  diffRender(j.items||[]);
+  applyCounts(j.counts||{}, j.total||0, j.page||1, j.pages||1);
+  pages = j.pages || 1;
+  // link CSV
+  const p2=buildParams(); p2.delete("page"); p2.delete("size");
+  dl.href="/api/export.csv?"+p2.toString();
+}
+function setRefresh(ms){
+  if(timer){ clearInterval(timer); timer=null; }
+  if(ms>0){ timer=setInterval(load, ms); }
+}
+$("#f").addEventListener("submit", e=>{ e.preventDefault(); page=1; load(); });
+$("#btnHoy").addEventListener("click", e=>{
+  e.preventDefault(); const t=new Date(); const y=t.toISOString().slice(0,10);
+  start.value=y; end.value=y; page=1; load();
+});
+$("#btn7").addEventListener("click", e=>{
+  e.preventDefault(); const t=new Date(); const s=new Date(t.getTime()-6*86400000);
+  start.value=s.toISOString().slice(0,10); end.value=t.toISOString().slice(0,10); page=1; load();
+});
+btnPrev.addEventListener("click", e=>{ e.preventDefault(); if(page>1){ page--; load(); }});
+btnNext.addEventListener("click", e=>{ e.preventDefault(); if(page<pages){ page++; load(); }});
+refreshSel.addEventListener("change", ()=>setRefresh(parseInt(refreshSel.value||"0",10)));
+load(); setRefresh(parseInt(refreshSel.value||"0",10));
+</script>
+</body></html>
+"""
+@app.get("/panel", response_class=HTMLResponse)
+def panel(req: Request):
+    require_login(req)
+    return PANEL_HTML
 
-# ========================= Endpoint de subida desde el detector =========================
-@app.post("/upload")
-async def upload_file(token: str = Form(...), kind: str = Form(...), file: UploadFile = File(...)):
-    if token != ORBET_UPLOAD_TOKEN:
-        raise HTTPException(401, "Token inválido")
+# -------------------- Run local --------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
 
-    if kind not in {"captura", "ticket"}:
-        raise HTTPException(400, "kind inválido")
-
-    # Guardar siempre en subcarpeta por fecha: YYYY-MM-DD
-    day_dir = (CAPTURES_DIR if kind == "captura" else TICKETS_DIR) / datetime.utcnow().strftime("%Y-%m-%d")
-    day_dir.mkdir(parents=True, exist_ok=True)
-    dest = day_dir / file.filename
-
-    # Evitar sobrescribir
-    i = 1
-    base = dest.stem
-    while dest.exists():
-        dest = day_dir / f"{base}_{i}{Path(file.filename).suffix}"
-        i += 1
-
-    with open(dest, "wb") as f:
-        f.write(await file.read())
-
-    rel_url = f"/files/{dest.relative_to(UPLOAD_ROOT).as_posix()}"
-    return {"ok": True, "url": rel_url}
-
-# ========================= Salud =========================
-@app.get("/healthz")
-def healthz():
-    return PlainTextResponse("ok")
