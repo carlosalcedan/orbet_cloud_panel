@@ -1,4 +1,6 @@
 fastapi
 uvicorn
 python-multipart
+itsdangerous>=2.1
+
 
