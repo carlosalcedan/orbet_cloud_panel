@@ -1,11 +1,22 @@
-# app.py — ORBET Cloud Panel: Login + Roles (admin/cliente) + /files protegido + Export CSV + Delete (solo admin)
-# Reqs: fastapi uvicorn python-multipart itsdangerous Pillow
-# Env en Render:
-#   SECRET_KEY     = <cadena larga aleatoria>
-#   USERS          = "admin:admin123:admin,cliente:1234:cliente"   # usuario:pass:rol
-#   ORBET_TOKEN    = "ORBET_2025_Seguridad_ARES"
-#   DATA_DIR       = "data"
-#   RETENTION_DAYS = "0"  (o los días que quieras retener)
+# app.py — ORBET Cloud Panel
+# Funciones: Login + Roles (admin/cliente) + Multi-tenant por usuario (carpetas) +
+# /files protegido + Filtro por categoría + Paginación + Export CSV + Delete (solo admin)
+#
+# Requisitos: fastapi uvicorn python-multipart itsdangerous Pillow
+#
+# Variables de entorno recomendadas (Render):
+#   SECRET_KEY       = <cadena larga aleatoria>
+#   USERS            = "admin:admin123:admin,cliente1:1234:cliente"   # usuario:pass:rol
+#   ORBET_TOKEN      = "ORBET_2025_Seguridad_ARES"
+#   DATA_DIR         = "data"
+#   RETENTION_DAYS   = "0"   # 0 = sin limpieza, o días a retener
+#
+# Subida desde ORBET local:
+#   POST /upload (multipart/form-data)
+#     token=ORBET_TOKEN
+#     kind=captura|ticket
+#     owner=<usuario destino>  (opcional; por defecto "admin")
+#     file=@archivo.jpg
 
 import os, io, csv, time, shutil
 from pathlib import Path
@@ -13,7 +24,7 @@ from datetime import datetime, date
 from typing import Optional, List, Dict, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, BackgroundTasks, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, StreamingResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 APP_NAME = "ORBET Cloud Panel"
@@ -22,9 +33,6 @@ APP_NAME = "ORBET Cloud Panel"
 ORBET_TOKEN = os.getenv("ORBET_TOKEN", "ORBET_2025_Seguridad_ARES")
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "0"))
 DATA_DIR = Path(os.getenv("DATA_DIR", "data")).resolve()
-CAP_DIR = DATA_DIR / "capturas"
-TIC_DIR = DATA_DIR / "tickets"
-for d in (CAP_DIR, TIC_DIR): d.mkdir(parents=True, exist_ok=True)
 
 # Login + Roles
 SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret_in_render")
@@ -35,26 +43,35 @@ for pair in [p.strip() for p in USERS_ENV.split(",") if p.strip()]:
     if len(parts) >= 2:
         u, p = parts[0].strip(), parts[1].strip()
         role = (parts[2].strip().lower() if len(parts) >= 3 else "admin")
-        if role not in ("admin", "cliente"): role = "admin"
+        if role not in ("admin", "cliente"):
+            role = "admin"
         USERS[u] = {"password": p, "role": role}
 
-# -------------------- Utils --------------------
-def today_dir(kind: str) -> Path:
-    base = CAP_DIR if kind == "capturas" else TIC_DIR
-    day = datetime.now().strftime("%Y-%m-%d")
-    p = base / day
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+# -------------------- Utils & FS --------------------
+def ensure_base_dirs():
+    # Creamos solo el directorio raíz; subcarpetas se crean on-demand
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 def secure_name(name: str) -> str:
     keep = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
     return "".join(c if c in keep else "_" for c in name)
 
+def parse_ymd(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+def _category_from_name(name: str) -> str:
+    n = name.lower()
+    if "persona" in n: return "PERSONA"
+    if any(x in n for x in ("auto", "car", "vehic", "truck", "bus")): return "AUTO"
+    if any(x in n for x in ("animal", "dog", "cat", "bird")): return "ANIMAL"
+    return "OTROS"
+
 def is_image(filename: str) -> bool:
     return filename.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
 
 def make_thumb(dest: Path):
-    if not is_image(dest.name): return
+    if not is_image(dest.name):
+        return
     try:
         from PIL import Image
         im = Image.open(dest)
@@ -65,65 +82,89 @@ def make_thumb(dest: Path):
         pass
 
 def cleanup_old(days: int):
-    if days <= 0: return
+    if days <= 0: 
+        return
     cutoff = time.time() - days * 86400
-    for base in (CAP_DIR, TIC_DIR):
-        for day_dir in base.iterdir():
-            if not day_dir.is_dir(): continue
-            try:
-                ts = time.mktime(time.strptime(day_dir.name, "%Y-%m-%d"))
-            except Exception:
+    # Borramos por debajo de DATA_DIR, recursivo por owners/kind/day
+    for owner_dir in DATA_DIR.iterdir():
+        if not owner_dir.is_dir(): 
+            continue
+        for kind_dir in owner_dir.iterdir():   # capturas / tickets
+            if not kind_dir.is_dir(): 
                 continue
-            if ts < cutoff:
-                shutil.rmtree(day_dir, ignore_errors=True)
+            for day_dir in kind_dir.iterdir():
+                if not day_dir.is_dir(): 
+                    continue
+                try:
+                    ts = time.mktime(time.strptime(day_dir.name, "%Y-%m-%d"))
+                except Exception:
+                    continue
+                if ts < cutoff:
+                    shutil.rmtree(day_dir, ignore_errors=True)
 
-def parse_ymd(s: str) -> date:
-    return datetime.strptime(s, "%Y-%m-%d").date()
+def owner_root(owner: str) -> Path:
+    p = DATA_DIR / secure_name(owner)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-def _category_from_name(name: str) -> str:
-    n = name.lower()
-    if "persona" in n: return "PERSONA"
-    if any(x in n for x in ("auto","car","vehic","truck","bus")): return "AUTO"
-    if any(x in n for x in ("animal","dog","cat","bird")): return "ANIMAL"
-    return "OTROS"
+def today_dir(owner: str, kind: str) -> Path:
+    # kind: "capturas" | "tickets"
+    base = owner_root(owner) / ("capturas" if kind == "capturas" else "tickets")
+    day = datetime.now().strftime("%Y-%m-%d")
+    p = base / day
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-def list_items(kind: str, start: Optional[date], end: Optional[date], q: Optional[str]) -> List[Dict]:
-    base = CAP_DIR if kind == "capturas" else TIC_DIR
+def list_items(owner: str, kind: str, start: Optional[date], end: Optional[date],
+               q: Optional[str], cat: Optional[str]) -> List[Dict]:
+    base = owner_root(owner) / ("capturas" if kind == "capturas" else "tickets")
     qnorm = (q or "").strip().lower()
+    cat = (cat or "").strip().upper()
     items: List[Dict] = []
-    for day_dir in sorted(base.iterdir(), reverse=True):
-        if not day_dir.is_dir(): continue
+
+    if not base.exists():
+        return items
+
+    for day_dir in sorted([d for d in base.iterdir() if d.is_dir()], reverse=True):
         try:
             d = parse_ymd(day_dir.name)
         except Exception:
             continue
-        if start and d < start: continue
-        if end and d > end: continue
-        for f in sorted(day_dir.iterdir(), reverse=True):
-            if not f.is_file(): continue
+        if start and d < start: 
+            continue
+        if end and d > end: 
+            continue
+
+        for f in sorted([x for x in day_dir.iterdir() if x.is_file()], reverse=True):
             name = f.name
+            c = _category_from_name(name)
+            if cat and c != cat:
+                continue
             if qnorm:
-                if qnorm not in name.lower() and qnorm not in _category_from_name(name).lower():
+                if qnorm not in name.lower() and qnorm not in c.lower():
                     continue
             items.append({
                 "date": d.isoformat(),
                 "name": name,
-                "url": f"/files/{kind}/{day_dir.name}/{name}",
+                "url": f"/files/{secure_name(owner)}/{kind}/{day_dir.name}/{name}",
                 "kind": kind,
-                "cat": _category_from_name(name),
+                "cat": c,
+                "owner": owner
             })
     return items
 
-# -------------------- App --------------------
+# -------------------- App & Auth --------------------
 app = FastAPI(title=APP_NAME)
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=60*60*12)  # 12h
 
 @app.on_event("startup")
 def _on_start():
-    try: cleanup_old(RETENTION_DAYS)
-    except Exception: pass
+    ensure_base_dirs()
+    try: 
+        cleanup_old(RETENTION_DAYS)
+    except Exception:
+        pass
 
-# -------------------- Auth helpers --------------------
 def current_user(req: Request) -> Optional[str]:
     return req.session.get("user")
 
@@ -140,11 +181,10 @@ def require_role(req: Request, allowed: Tuple[str, ...]):
     if role not in allowed:
         raise HTTPException(status_code=403, detail="Permisos insuficientes")
 
-# -------------------- Login/Logout --------------------
+# -------------------- Login / Logout --------------------
 LOGIN_HTML = """
 <!doctype html><html lang="es"><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Ingresar – ORBET</title>
 <style>
 body{background:#0f1220;color:#e7e7ee;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
@@ -172,7 +212,7 @@ button{cursor:pointer;margin-top:10px}
 
 @app.get("/login", response_class=HTMLResponse)
 def login_form():
-    return LOGIN_HTML.replace("{msg}","")
+    return LOGIN_HTML.replace("{msg}", "")
 
 @app.post("/login")
 def login(req: Request, username: str = Form(...), password: str = Form(...)):
@@ -189,7 +229,6 @@ def logout(req: Request):
     req.session.clear()
     return RedirectResponse(url="/login", status_code=302)
 
-# ---------- Who am I ----------
 @app.get("/me")
 def me(req: Request):
     require_login(req)
@@ -206,6 +245,7 @@ async def upload(
     token: str = Form(...),
     kind: str = Form(...),  # "captura" | "ticket"
     file: UploadFile = File(...),
+    owner: str = Form("admin"),  # nombre de usuario destino => carpeta
     background: BackgroundTasks = None,
 ):
     if token != ORBET_TOKEN:
@@ -213,7 +253,9 @@ async def upload(
     if kind not in ("captura", "ticket"):
         raise HTTPException(status_code=400, detail="kind debe ser 'captura' o 'ticket'")
 
-    target_dir = today_dir("capturas" if kind == "captura" else "tickets")
+    kind_dir = "capturas" if kind == "captura" else "tickets"
+    target_dir = today_dir(owner, kind_dir)
+
     original = secure_name(file.filename or f"file_{int(time.time())}")
     stamp = datetime.now().strftime("%H-%M-%S")
     dest = target_dir / f"{stamp}_{original}"
@@ -222,88 +264,147 @@ async def upload(
     with open(dest, "wb") as fh:
         fh.write(data)
 
-    if background: background.add_task(make_thumb, dest)
-    else: make_thumb(dest)
+    if background: 
+        background.add_task(make_thumb, dest)
+    else: 
+        make_thumb(dest)
 
-    url = f"/files/{'capturas' if kind=='captura' else 'tickets'}/{target_dir.name}/{dest.name}"
-    return {"ok": True, "url": url, "name": dest.name}
+    url = f"/files/{secure_name(owner)}/{kind_dir}/{target_dir.name}/{dest.name}"
+    return {"ok": True, "url": url, "name": dest.name, "owner": owner}
 
 # -------------------- /files protegido (requiere login) --------------------
-def _safe_path(kind: str, day: str, name: str) -> Path:
+def _safe_path(owner: str, kind: str, day: str, name: str) -> Path:
     if kind not in ("capturas", "tickets"):
         raise HTTPException(status_code=404, detail="No encontrado")
+    owner = secure_name(owner)
     day = secure_name(day)
     name = secure_name(name)
-    base = CAP_DIR if kind == "capturas" else TIC_DIR
+    base = DATA_DIR / owner / kind
     path = (base / day / name).resolve()
-    if not str(path).startswith(str(base.resolve())):
+    # restrict traversal
+    if not str(path).startswith(str((DATA_DIR / owner).resolve())):
         raise HTTPException(status_code=403, detail="Ruta inválida")
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="No encontrado")
     return path
 
-@app.get("/files/{kind}/{day}/{name}")
-def get_file(req: Request, kind: str, day: str, name: str):
+def _can_access_owner(req: Request, owner: str) -> bool:
+    role = current_role(req)
+    user = current_user(req)
+    if role == "admin":
+        return True
+    # cliente: solo su propio owner
+    return owner == user
+
+@app.get("/files/{owner}/{kind}/{day}/{name}")
+def get_file(req: Request, owner: str, kind: str, day: str, name: str):
     require_login(req)
-    path = _safe_path(kind, day, name)
+    if not _can_access_owner(req, owner):
+        raise HTTPException(status_code=403, detail="Permisos insuficientes")
+    path = _safe_path(owner, kind, day, name)
     media = "application/octet-stream"
-    if is_image(path.name): media = "image/jpeg" if path.suffix.lower() in (".jpg",".jpeg") else "image/png"
+    if is_image(path.name):
+        media = "image/jpeg" if path.suffix.lower() in (".jpg", ".jpeg") else "image/png"
     return FileResponse(path, media_type=media)
 
 # -------------------- API list (requiere login) --------------------
-@app.get("/api/list", summary="Lista archivos con filtros de fecha y búsqueda")
+@app.get("/api/list", summary="Lista archivos con filtros, categoría y paginación")
 def api_list(
     req: Request,
+    # scope de datos
+    owner: Optional[str] = Query(None, description="Owner (solo admin; si no, se usa el propio usuario)"),
     kind: str = Query("capturas", pattern="^(capturas|tickets)$"),
+    # filtros
     start: Optional[str] = None,
     end: Optional[str] = None,
     q: Optional[str] = None,
+    cat: Optional[str] = Query(None, description="PERSONA|AUTO|ANIMAL|OTROS"),
+    # paginación
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
 ):
     require_login(req)
+    role = current_role(req)
+    user = current_user(req)
+
+    if role != "admin":
+        owner = user   # cliente restringido a su carpeta
+    else:
+        owner = owner or user  # por defecto, el admin puede consultar su carpeta; puede elegir otra
+
     s = parse_ymd(start) if start else None
     e = parse_ymd(end) if end else None
-    items = list_items(kind, s, e, q)
+
+    items_all = list_items(owner, kind, s, e, q, cat)
+    total = len(items_all)
+
+    # paginación
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    items = items_all[start_idx:end_idx]
+
+    # conteo por categoría (de los items filtrados completos, no solo la página)
     counts = {"PERSONA": 0, "AUTO": 0, "ANIMAL": 0, "OTROS": 0}
-    for it in items:
+    for it in items_all:
         counts[it["cat"]] = counts.get(it["cat"], 0) + 1
-    return {"ok": True, "count": len(items), "items": items, "counts": counts}
+
+    return {
+        "ok": True,
+        "owner": owner,
+        "count": len(items),
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "pages": (total + limit - 1) // limit,
+        "items": items,
+        "counts": counts
+    }
 
 # -------------------- Export CSV (requiere login) --------------------
 @app.get("/api/export.csv")
 def export_csv(
     req: Request,
+    owner: Optional[str] = Query(None),
     kind: str = Query("capturas", pattern="^(capturas|tickets)$"),
     start: Optional[str] = None,
     end: Optional[str] = None,
     q: Optional[str] = None,
+    cat: Optional[str] = Query(None),
 ):
     require_login(req)
+    role = current_role(req)
+    user = current_user(req)
+    if role != "admin":
+        owner = user
+    else:
+        owner = owner or user
+
     s = parse_ymd(start) if start else None
     e = parse_ymd(end) if end else None
-    items = list_items(kind, s, e, q)
+    items = list_items(owner, kind, s, e, q, cat)
 
     def gen():
         sio = io.StringIO()
         writer = csv.writer(sio)
-        writer.writerow(["fecha", "tipo", "categoria", "nombre_archivo", "url"])
+        writer.writerow(["owner", "fecha", "tipo", "categoria", "nombre_archivo", "url"])
         for it in items:
-            writer.writerow([it["date"], it["kind"], it["cat"], it["name"], it["url"]])
+            writer.writerow([it["owner"], it["date"], it["kind"], it["cat"], it["name"], it["url"]])
         yield sio.getvalue()
 
-    headers = {"Content-Disposition": f'attachment; filename="orbet_{kind}.csv"'}
+    headers = {"Content-Disposition": f'attachment; filename="orbet_{owner}_{kind}.csv"'}
     return StreamingResponse(gen(), headers=headers, media_type="text/csv; charset=utf-8")
 
 # -------------------- Delete (solo admin) --------------------
 @app.delete("/api/delete")
 def api_delete(
     req: Request,
+    owner: str = Query(...),
     kind: str = Query(..., pattern="^(capturas|tickets)$"),
     day: str = Query(...),
     name: str = Query(...),
 ):
     require_role(req, ("admin",))
-    path = _safe_path(kind, day, name)
-    # borra archivo y miniatura
+    path = _safe_path(owner, kind, day, name)
     try:
         path.unlink(missing_ok=True)
         thumb = path.with_suffix(path.suffix + ".thumb.jpg")
@@ -312,7 +413,7 @@ def api_delete(
         raise HTTPException(status_code=500, detail=f"No se pudo borrar: {e}")
     return {"ok": True}
 
-# -------------------- UI: vista rápida (requiere login) --------------------
+# -------------------- UI: Vista rápida (requiere login) --------------------
 INDEX_HTML = """
 <!doctype html>
 <html lang="es">
@@ -325,7 +426,7 @@ body{background:#0f1220;color:#e7e7ee;font-family:system-ui,Segoe UI,Roboto,Aria
 h1{font-size:22px;margin:0 0 12px}
 .card{background:#171a2b;border:1px solid #262a41;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 6px 18px rgba(0,0,0,.25)}
 .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-select{background:#0f1220;color:#e7e7ee;border:1px solid #2b3050;border-radius:10px;padding:8px 10px}
+select,input,button{background:#0f1220;color:#e7e7ee;border:1px solid #2b3050;border-radius:10px;padding:6px 10px}
 .badge{font-size:11px;background:#24305a;padding:4px 8px;border-radius:999px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
 .item{background:#11152a;border:1px solid #2a2f4a;border-radius:12px;padding:10px;opacity:0;transition:opacity .25s ease}
@@ -342,32 +443,43 @@ a{color:#9ecbff}
   <h1>ORBET – Galería en vivo <span id="who"></span> <a class="right" href="/logout">Salir</a></h1>
   <div class="card">
     <div class="row">
+      <label>Owner <input id="owner" placeholder="(admin puede cambiar)"></label>
       <label>Tipo
-        <select id="kind">
-          <option value="capturas">Capturas</option>
-          <option value="tickets">Tickets</option>
-        </select>
+        <select id="kind"><option value="capturas">Capturas</option><option value="tickets">Tickets</option></select>
+      </label>
+      <label>Categoría
+        <select id="cat"><option value="">Todas</option><option>PERSONA</option><option>AUTO</option><option>ANIMAL</option><option>OTROS</option></select>
       </label>
       <span id="count" class="badge">0</span>
       <a href="/panel">Ir al Panel con filtros</a>
     </div>
   </div>
   <div class="card"><div id="grid" class="grid"></div></div>
+  <div class="card">
+    <div class="row">
+      <button id="prev">⬅ Anterior</button>
+      <span id="pageInfo" class="badge">1/1</span>
+      <button id="next">Siguiente ➡</button>
+    </div>
+  </div>
 </div>
 <script>
-let canDelete=false;
+let canDelete=false, myRole="cliente", myUser="";
 const $=s=>document.querySelector(s);
-const grid=$("#grid"), countEl=$("#count"), kind=$("#kind"), who=$("#who");
+const grid=$("#grid"), countEl=$("#count"), kind=$("#kind"), who=$("#who"), cat=$("#cat");
+const owner=$("#owner"), prev=$("#prev"), next=$("#next"), pageInfo=$("#pageInfo");
+let page=1, pages=1, limit=50;
+
 const cardId=url=>"i_"+btoa(url).replace(/=/g,"");
 function ensureCard(it){
   const id=cardId(it.url); let el=document.getElementById(id);
   if(!el){
     const isImg=/\\.(jpg|jpeg|png|gif|webp)$/i.test(it.name);
     const thumb=isImg?`<img loading="lazy" src="${it.url}" alt="${it.name}">`:`<div style="padding:20px;font-size:13px;opacity:.9">📄 ${it.name}</div>`;
-    const delBtn = canDelete? `<button class="btn" data-del="${it.url}">🗑</button>` : "";
+    const delBtn = canDelete? `<button class="btn" data-del="${it.url}" data-owner="${it.owner}" data-kind="${it.kind}" data-date="${it.date}" data-name="${it.name}">🗑</button>` : "";
     el=document.createElement("div"); el.className="item"; el.id=id;
-    el.innerHTML=thumb+`<div class="meta"><span>${it.date}</span><div><a class="btn" target="_blank" href="${it.url}">Abrir</a> ${delBtn}</div></div>`;
-    grid.prepend(el); requestAnimationFrame(()=>el.classList.add("show"));
+    el.innerHTML=thumb+`<div class="meta"><span>${it.date} · ${it.cat}</span><div><a class="btn" target="_blank" href="${it.url}">Abrir</a> ${delBtn}</div></div>`;
+    grid.appendChild(el); requestAnimationFrame(()=>el.classList.add("show"));
   }
   return el;
 }
@@ -376,36 +488,56 @@ function bindDeletes(){
   grid.querySelectorAll("[data-del]").forEach(btn=>{
     btn.onclick=async ()=>{
       if(!confirm("¿Borrar este archivo?")) return;
-      const u=new URL(btn.getAttribute("data-del"), location.origin);
-      const parts=u.pathname.split("/"); // /files/{kind}/{day}/{name}
-      const kind=parts[2], day=parts[3], name=parts.slice(4).join("/");
-      const qs=new URLSearchParams({kind,day,name});
+      const qs=new URLSearchParams({
+        owner: btn.dataset.owner,
+        kind: btn.dataset.kind,
+        day: btn.dataset.date,
+        name: btn.dataset.name
+      });
       const r=await fetch("/api/delete?"+qs.toString(), {method:"DELETE"});
-      if(r.ok){ document.getElementById(cardId(u.pathname)).remove(); }
+      if(r.ok){ btn.closest(".item")?.remove(); }
     };
   });
 }
 function diffRender(items){
-  const want=new Set(items.map(it=>cardId(it.url)));
-  Array.from(grid.children).forEach(ch=>{ if(!want.has(ch.id)) ch.remove(); });
+  grid.innerHTML=""; // simple: reemplazo por página
   items.forEach(it=>ensureCard(it));
-  countEl.textContent=items.length; bindDeletes();
+  bindDeletes();
 }
 async function load(){
-  const r=await fetch("/api/list?kind="+kind.value);
+  const p=new URLSearchParams();
+  p.set("kind", kind.value);
+  p.set("page", String(page));
+  p.set("limit", String(limit));
+  if(cat.value) p.set("cat", cat.value);
+  if(owner.value) p.set("owner", owner.value);
+
+  const r=await fetch("/api/list?"+p.toString());
   if(r.status==401){ location.href="/login"; return; }
-  const j=await r.json(); diffRender(j.items||[]);
+  const j=await r.json();
+  countEl.textContent=j.total;
+  pages=j.pages||1; page=j.page||1;
+  pageInfo.textContent=`${page}/${pages}`;
+  diffRender(j.items||[]);
 }
 async function boot(){
   const me=await fetch("/me"); if(me.status==401){ location.href="/login"; return; }
-  const info=await me.json(); canDelete=(info.role==="admin"); who.textContent=`· ${info.user} (${info.role})`;
+  const info=await me.json(); myRole=info.role; myUser=info.user;
+  canDelete=(myRole==="admin");
+  who.textContent=`· ${myUser} (${myRole})`;
+  if(myRole!=="admin"){ owner.value=myUser; owner.disabled=true; }
   await load(); setInterval(load, 5000);
 }
-kind.addEventListener("change", load);
+kind.addEventListener("change", ()=>{ page=1; load(); });
+cat.addEventListener("change", ()=>{ page=1; load(); });
+owner.addEventListener("change", ()=>{ page=1; load(); });
+prev.addEventListener("click", ()=>{ if(page>1){ page--; load(); }});
+next.addEventListener("click", ()=>{ if(page<pages){ page++; load(); }});
 boot();
 </script>
 </body></html>
 """
+
 @app.get("/", response_class=HTMLResponse)
 def index(req: Request):
     require_login(req)
@@ -445,29 +577,30 @@ a{color:#9ecbff}
 
   <div class="card">
     <form id="f" class="row">
+      <label>Owner <input id="owner" placeholder="(admin puede cambiar)"></label>
       <label>Tipo
         <select id="kind">
           <option value="capturas">Capturas</option>
           <option value="tickets">Tickets</option>
         </select>
       </label>
-      <label>Desde <input type="date" id="start"></label>
-      <label>Hasta <input type="date" id="end"></label>
-      <label>Buscar (nombre o categoría)
-        <input type="text" id="q" placeholder="persona / auto / animal / texto">
-      </label>
-      <button type="submit">Filtrar</button>
-      <button id="btnHoy">Hoy</button>
-      <button id="btn7">Últimos 7 días</button>
-      <label>Autorefresco
-        <select id="refreshSel">
-          <option value="0">Apagado</option>
-          <option value="30000">Cada 30 s</option>
+      <label>Categoría
+        <select id="cat">
+          <option value="">Todas</option><option>PERSONA</option><option>AUTO</option><option>ANIMAL</option><option>OTROS</option>
         </select>
       </label>
+      <label>Desde <input type="date" id="start"></label>
+      <label>Hasta <input type="date" id="end"></label>
+      <label>Buscar (texto) <input type="text" id="q" placeholder="persona / auto / animal / texto"></label>
+      <label>Página <input type="number" id="page" min="1" value="1" style="width:90px"></label>
+      <label>Por página
+        <select id="limit"><option>25</option><option selected>50</option><option>100</option><option>200</option></select>
+      </label>
+      <button type="submit">Aplicar</button>
       <a href="/">Vista rápida</a>
       <a id="dl" href="#" download>⬇️ CSV</a>
       <span id="count" class="badge">0</span>
+      <span id="pages" class="badge">1/1</span>
     </form>
   </div>
 
@@ -484,13 +617,13 @@ a{color:#9ecbff}
 </div>
 
 <script>
-let canDelete=false;
+let canDelete=false, myRole="cliente", myUser="";
 const $=sel=>document.querySelector(sel);
-const grid=$("#grid"), countEl=$("#count");
-const kind=$("#kind"), start=$("#start"), end=$("#end"), q=$("#q");
+const grid=$("#grid"), countEl=$("#count"), pagesEl=$("#pages"), dl=$("#dl");
+const kind=$("#kind"), start=$("#start"), end=$("#end"), q=$("#q"), cat=$("#cat");
+const owner=$("#owner"), page=$("#page"), limit=$("#limit");
 const cP=$("#cP"), cA=$("#cA"), cN=$("#cN"), cO=$("#cO");
-const refreshSel=$("#refreshSel"); let timer=null;
-const dl=$("#dl");
+
 const cardId=url=>"i_"+btoa(url).replace(/=/g,"");
 
 function ensureCard(it){
@@ -498,9 +631,9 @@ function ensureCard(it){
   if(!el){
     const isImg=/\\.(jpg|jpeg|png|gif|webp)$/i.test(it.name);
     const thumb=isImg?`<img loading="lazy" src="${it.url}" alt="${it.name}">`:`<div style="padding:20px;font-size:13px;opacity:.9">📄 ${it.name}</div>`;
-    const delBtn = canDelete? `<button class="btn" data-del="${it.url}">🗑</button>` : "";
+    const delBtn = canDelete? `<button class="btn" data-del="${it.url}" data-owner="${it.owner}" data-kind="${it.kind}" data-date="${it.date}" data-name="${it.name}">🗑</button>` : "";
     el=document.createElement("div"); el.className="item"; el.id=id;
-    el.innerHTML=thumb+`<div class="meta"><span>${it.date}</span><div><a class="btn" target="_blank" href="${it.url}">Abrir</a> ${delBtn}</div></div>`;
+    el.innerHTML=thumb+`<div class="meta"><span>${it.date} · ${it.cat}</span><div><a class="btn" target="_blank" href="${it.url}">Abrir</a> ${delBtn}</div></div>`;
     grid.appendChild(el); requestAnimationFrame(()=>el.classList.add("show"));
   }
   return el;
@@ -510,20 +643,21 @@ function bindDeletes(){
   grid.querySelectorAll("[data-del]").forEach(btn=>{
     btn.onclick=async ()=>{
       if(!confirm("¿Borrar este archivo?")) return;
-      const u=new URL(btn.getAttribute("data-del"), location.origin);
-      const parts=u.pathname.split("/"); // /files/{kind}/{day}/{name}
-      const kind=parts[2], day=parts[3], name=parts.slice(4).join("/");
-      const qs=new URLSearchParams({kind,day,name});
+      const qs=new URLSearchParams({
+        owner: btn.dataset.owner,
+        kind: btn.dataset.kind,
+        day: btn.dataset.date,
+        name: btn.dataset.name
+      });
       const r=await fetch("/api/delete?"+qs.toString(), {method:"DELETE"});
-      if(r.ok){ document.getElementById(cardId(u.pathname)).remove(); }
+      if(r.ok){ btn.closest(".item")?.remove(); }
     };
   });
 }
 function diffRender(items){
-  const want=new Set(items.map(it=>cardId(it.url)));
-  Array.from(grid.children).forEach(ch=>{ if(!want.has(ch.id)) ch.remove(); });
-  items.forEach(it=>ensureCard(it));
-  countEl.textContent=items.length; bindDeletes();
+  grid.innerHTML="";
+  (items||[]).forEach(it=>ensureCard(it));
+  bindDeletes();
 }
 function applyCounts(counts){
   cP.textContent="PERSONA: "+(counts["PERSONA"]||0);
@@ -534,41 +668,38 @@ function applyCounts(counts){
 function buildParams(){
   const p=new URLSearchParams();
   p.set("kind", kind.value);
+  p.set("page", page.value||"1");
+  p.set("limit", limit.value||"50");
   if(start.value) p.set("start", start.value);
   if(end.value) p.set("end", end.value);
   if(q.value.trim()) p.set("q", q.value.trim());
+  if(cat.value) p.set("cat", cat.value);
+  if(owner.value) p.set("owner", owner.value);
   return p;
 }
 async function load(){
   const r=await fetch("/api/list?"+buildParams().toString());
   if(r.status==401){ location.href="/login"; return; }
-  const j=await r.json(); diffRender(j.items||[]); applyCounts(j.counts||{});
+  const j=await r.json();
+  countEl.textContent=j.total||0;
+  pagesEl.textContent=(j.page||1)+"/"+(j.pages||1);
+  diffRender(j.items||[]); applyCounts(j.counts||{});
   dl.href="/api/export.csv?"+buildParams().toString();
-}
-function setRefresh(ms){
-  if(timer){ clearInterval(timer); timer=null; }
-  if(ms>0){ timer=setInterval(load, ms); }
 }
 async function boot(){
   const me=await fetch("/me"); if(me.status==401){ location.href="/login"; return; }
   const info=await me.json(); canDelete=(info.role==="admin");
-  document.querySelector("#who").textContent = `· ${info.user} (${info.role})`;
-  load(); setRefresh(parseInt(refreshSel.value||"0",10));
+  myRole=info.role; myUser=info.user;
+  document.querySelector("#who")?.remove(); // (solo para coherencia si reusamos estilos)
+  if(myRole!=="admin"){ owner.value=myUser; owner.disabled=true; }
+  load();
 }
 $("#f").addEventListener("submit", e=>{ e.preventDefault(); load(); });
-$("#btnHoy").addEventListener("click", e=>{
-  e.preventDefault(); const t=new Date(); const y=t.toISOString().slice(0,10);
-  start.value=y; end.value=y; load();
-});
-$("#btn7").addEventListener("click", e=>{
-  e.preventDefault(); const t=new Date(); const s=new Date(t.getTime()-6*86400000);
-  start.value=s.toISOString().slice(0,10); end.value=t.toISOString().slice(0,10); load();
-});
-refreshSel.addEventListener("change", ()=>setRefresh(parseInt(refreshSel.value||"0",10)));
 boot();
 </script>
 </body></html>
 """
+
 @app.get("/panel", response_class=HTMLResponse)
 def panel(req: Request):
     require_login(req)
