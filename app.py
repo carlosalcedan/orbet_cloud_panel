@@ -23,7 +23,7 @@
 # - Si ORBET_TOKENS está definido, se usa para validar token+owner.
 # - Si ORBET_TOKENS está vacío, se usa ORBET_TOKEN global como antes.
 
-import os, io, csv, time, shutil
+import os, io, csv, time, shutil, sqlite3
 from pathlib import Path
 from datetime import datetime, date
 from typing import Optional, List, Dict, Tuple
@@ -38,6 +38,7 @@ APP_NAME = "ORBET Cloud Panel"
 ORBET_TOKEN = os.getenv("ORBET_TOKEN", "ORBET_2025_Seguridad_ARES")
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "0"))
 DATA_DIR = Path(os.getenv("DATA_DIR", "data")).resolve()
+DB_FILE = DATA_DIR / "orbet_cloud.db"   # BD del panel (tickets, etc.)
 
 # Login + Roles
 SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret_in_render")
@@ -169,6 +170,43 @@ def list_items(owner: str, kind: str, start: Optional[date], end: Optional[date]
             })
     return items
 
+# -------------------- DB: Tickets vehiculares --------------------
+def get_db():
+    conn = sqlite3.connect(str(DB_FILE))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS tickets_vehiculares (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner               TEXT NOT NULL,
+        fecha               TEXT NOT NULL,             -- YYYY-MM-DD
+        correlativo_dia     INTEGER NOT NULL,          -- 1,2,3... por día y owner
+
+        captura_date        TEXT NOT NULL,             -- carpeta día de la captura
+        captura_name        TEXT NOT NULL,             -- nombre de archivo
+
+        fecha_hora          TEXT NOT NULL,             -- ISO: YYYY-MM-DDTHH:MM:SS
+        tipo_movimiento     TEXT NOT NULL,             -- ENTRADA / SALIDA
+        placa               TEXT,
+        chofer_nombre       TEXT,
+        chofer_dni          TEXT,
+        empresa_transporte  TEXT,
+        tipo_vehiculo       TEXT,
+        tipo_material       TEXT,
+        guia_remision       TEXT,
+        observaciones       TEXT,
+
+        creado_por          TEXT,
+        creado_en           TEXT DEFAULT (datetime('now'))
+    );
+    """)
+    conn.commit()
+    conn.close()
+
 # -------------------- Token validation --------------------
 def _validate_token(owner: str, token: str):
     """
@@ -192,10 +230,14 @@ app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=60*60*12)  
 @app.on_event("startup")
 def _on_start():
     ensure_base_dirs()
-    try: 
+    try:
         cleanup_old(RETENTION_DAYS)
     except Exception:
         pass
+    try:
+        init_db()
+    except Exception as e:
+        print("Error init_db:", e)
 
 def current_user(req: Request) -> Optional[str]:
     return req.session.get("user")
@@ -392,6 +434,172 @@ def api_list(
         "items": items,
         "counts": counts
     }
+
+# -------------------- Tickets: detalle de captura --------------------
+@app.get("/api/capture_detail")
+def capture_detail(
+    req: Request,
+    owner: str = Query(...),
+    kind: str = Query(...),
+    day: str = Query(..., description="YYYY-MM-DD"),
+    name: str = Query(...),
+):
+    require_login(req)
+    if kind != "capturas":
+        raise HTTPException(status_code=400, detail="Solo válido para capturas")
+
+    if not _can_access_owner(req, owner):
+        raise HTTPException(status_code=403, detail="Permisos insuficientes")
+
+    url = f"/files/{secure_name(owner)}/capturas/{secure_name(day)}/{secure_name(name)}"
+
+    # Intentar inferir fecha_hora a partir del nombre (prefijo HH-MM-SS_)
+    fecha_hora = None
+    try:
+        stamp = name.split("_", 1)[0]               # "14-37-22"
+        hhmmss = stamp.replace("-", ":")            # "14:37:22"
+        fecha_hora = f"{day}T{hhmmss}"
+    except Exception:
+        fecha_hora = f"{day}T00:00:00"
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM tickets_vehiculares
+        WHERE owner = ? AND captura_date = ? AND captura_name = ?
+        LIMIT 1
+    """, (owner, day, name))
+    row = cur.fetchone()
+    conn.close()
+
+    ticket = {"has_ticket": False}
+    if row:
+        ticket = {
+            "has_ticket": True,
+            "id": row["id"],
+            "correlativo_dia": row["correlativo_dia"],
+            "fecha": row["fecha"],
+            "fecha_hora": row["fecha_hora"],
+            "tipo_movimiento": row["tipo_movimiento"],
+            "placa": row["placa"],
+            "chofer_nombre": row["chofer_nombre"],
+            "chofer_dni": row["chofer_dni"],
+            "empresa_transporte": row["empresa_transporte"],
+            "tipo_vehiculo": row["tipo_vehiculo"],
+            "tipo_material": row["tipo_material"],
+            "guia_remision": row["guia_remision"],
+            "observaciones": row["observaciones"],
+            "creado_por": row["creado_por"],
+        }
+        fecha_hora = row["fecha_hora"]
+
+    return {
+        "ok": True,
+        "owner": owner,
+        "captura_date": day,
+        "captura_name": name,
+        "url": url,
+        "fecha_hora": fecha_hora,
+        "ticket": ticket,
+    }
+
+# -------------------- Tickets: crear / actualizar --------------------
+@app.post("/api/ticket")
+def upsert_ticket(
+    req: Request,
+    owner: str = Form(...),
+    captura_date: str = Form(...),
+    captura_name: str = Form(...),
+    tipo_movimiento: str = Form(...),
+    placa: str = Form(""),
+    chofer_nombre: str = Form(""),
+    chofer_dni: str = Form(""),
+    empresa_transporte: str = Form(""),
+    tipo_vehiculo: str = Form(""),
+    tipo_material: str = Form(""),
+    guia_remision: str = Form(""),
+    observaciones: str = Form(""),
+):
+    require_login(req)
+    user = current_user(req)
+
+    if not _can_access_owner(req, owner):
+        raise HTTPException(status_code=403, detail="Permisos insuficientes")
+
+    tipo_movimiento = tipo_movimiento.upper().strip()
+    if tipo_movimiento not in ("ENTRADA", "SALIDA"):
+        raise HTTPException(status_code=400, detail="tipo_movimiento debe ser ENTRADA o SALIDA")
+
+    fecha = captura_date
+    try:
+        stamp = captura_name.split("_", 1)[0]
+        hhmmss = stamp.replace("-", ":")
+        fecha_hora = f"{fecha}T{hhmmss}"
+    except Exception:
+        fecha_hora = f"{fecha}T00:00:00"
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # ¿Ya existe ticket para esta captura?
+    cur.execute("""
+        SELECT id, correlativo_dia
+        FROM tickets_vehiculares
+        WHERE owner = ? AND captura_date = ? AND captura_name = ?
+        LIMIT 1
+    """, (owner, captura_date, captura_name))
+    row = cur.fetchone()
+
+    if row:
+        ticket_id = row["id"]
+        correlativo_dia = row["correlativo_dia"]
+        cur.execute("""
+            UPDATE tickets_vehiculares
+            SET fecha_hora = ?, tipo_movimiento = ?, placa = ?, chofer_nombre = ?,
+                chofer_dni = ?, empresa_transporte = ?, tipo_vehiculo = ?,
+                tipo_material = ?, guia_remision = ?, observaciones = ?,
+                creado_por = ?
+            WHERE id = ?
+        """, (
+            fecha_hora, tipo_movimiento, placa, chofer_nombre,
+            chofer_dni, empresa_transporte, tipo_vehiculo,
+            tipo_material, guia_remision, observaciones,
+            user, ticket_id
+        ))
+    else:
+        cur.execute("""
+            SELECT COALESCE(MAX(correlativo_dia), 0) AS max_corr
+            FROM tickets_vehiculares
+            WHERE owner = ? AND fecha = ?
+        """, (owner, fecha))
+        max_row = cur.fetchone()
+        next_corr = (max_row["max_corr"] if max_row else 0) + 1
+
+        cur.execute("""
+            INSERT INTO tickets_vehiculares (
+                owner, fecha, correlativo_dia,
+                captura_date, captura_name,
+                fecha_hora, tipo_movimiento, placa, chofer_nombre,
+                chofer_dni, empresa_transporte, tipo_vehiculo,
+                tipo_material, guia_remision, observaciones,
+                creado_por
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            owner, fecha, next_corr,
+            captura_date, captura_name,
+            fecha_hora, tipo_movimiento, placa, chofer_nombre,
+            chofer_dni, empresa_transporte, tipo_vehiculo,
+            tipo_material, guia_remision, observaciones,
+            user
+        ))
+        ticket_id = cur.lastrowid
+        correlativo_dia = next_corr
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "id": ticket_id, "correlativo_dia": correlativo_dia}
 
 # -------------------- Export CSV (requiere login) --------------------
 @app.get("/api/export.csv")
@@ -593,7 +801,7 @@ h1{font-size:26px;margin:0 0 14px}
 input,select,button{background:#0f1220;color:#e7e7ee;border:1px solid #2b3050;border-radius:10px;padding:8px 10px}
 button{cursor:pointer}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
-.item{background:#11152a;border:1px solid #2a2f4a;border-radius:12px;padding:10px;opacity:0;transition:opacity .25s ease}
+.item{background:#11152a;border:1px solid #2a2f4a;border-radius:12px;padding:10px;opacity:0;transition:opacity .25s ease;cursor:pointer}
 .item.show{opacity:1}
 .item img{width:100%;display:block;border-radius:10px}
 .meta{font-size:12px;opacity:.85;margin-top:6px;display:flex;justify-content:space-between;gap:8px;align-items:center}
@@ -602,6 +810,18 @@ button{cursor:pointer}
 .btn{background:#24305a;border:none;border-radius:8px;padding:4px 8px;color:#e7e7ee;text-decoration:none;cursor:pointer}
 a{color:#9ecbff}
 .right{margin-left:auto}
+
+/* Modal ticket */
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:50}
+.modal{background:#171a2b;border-radius:16px;border:1px solid #262a41;max-width:900px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 12px 30px rgba(0,0,0,.4);padding:16px}
+.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.modal-body{display:flex;gap:12px;flex-wrap:wrap}
+.modal-body img{max-width:380px;width:100%;border-radius:10px;background:#000}
+.modal-form{flex:1;min-width:260px}
+.modal-form label{font-size:12px;opacity:.9;display:block;margin-top:6px}
+.modal-form input,.modal-form select,.modal-form textarea{width:100%;background:#0f1220;color:#e7e7ee;border:1px solid #2b3050;border-radius:10px;padding:6px 8px;font-size:13px}
+.modal-form textarea{min-height:70px;resize:vertical}
+.hidden{display:none}
 </style>
 </head>
 <body>
@@ -649,6 +869,71 @@ a{color:#9ecbff}
   <div class="card"><div id="grid" class="grid"></div></div>
 </div>
 
+<!-- Modal Ticket Vehicular -->
+<div id="ticketBackdrop" class="modal-backdrop hidden">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>Ticket vehicular</h2>
+      <button id="ticketClose" class="btn" type="button">Cerrar ✖</button>
+    </div>
+    <div class="modal-body">
+      <div>
+        <img id="ticketImg" src="" alt="Captura">
+        <div style="font-size:12px;opacity:.8;margin-top:4px">
+          Fecha/hora: <span id="t_fecha_hora"></span><br>
+          N° diario: <span id="t_correlativo">-</span>
+        </div>
+      </div>
+      <form id="ticketForm" class="modal-form">
+        <input type="hidden" id="t_owner">
+        <input type="hidden" id="t_captura_date">
+        <input type="hidden" id="t_captura_name">
+
+        <label>Tipo de movimiento
+          <select id="t_tipo_movimiento">
+            <option value="ENTRADA">ENTRADA</option>
+            <option value="SALIDA">SALIDA</option>
+          </select>
+        </label>
+
+        <label>Placa
+          <input id="t_placa" placeholder="V7M-842">
+        </label>
+
+        <label>Nombre del chofer
+          <input id="t_chofer_nombre" placeholder="Nombre completo">
+        </label>
+
+        <label>DNI del chofer
+          <input id="t_chofer_dni" placeholder="DNI">
+        </label>
+
+        <label>Empresa transportista
+          <input id="t_empresa_transporte" placeholder="Empresa o razón social">
+        </label>
+
+        <label>Tipo de vehículo
+          <input id="t_tipo_vehiculo" placeholder="Camión, cisterna, camioneta...">
+        </label>
+
+        <label>Tipo de material
+          <input id="t_tipo_material" placeholder="Fertilizante, repuestos, etc.">
+        </label>
+
+        <label>N° Guía de remisión
+          <input id="t_guia_remision" placeholder="001-000123">
+        </label>
+
+        <label>Observaciones
+          <textarea id="t_observaciones" placeholder="EPP, sellos, novedades..."></textarea>
+        </label>
+
+        <button type="submit" class="btn" style="margin-top:10px">Guardar ticket</button>
+      </form>
+    </div>
+  </div>
+</div>
+
 <script>
 let canDelete=false, myRole="cliente", myUser="";
 const $=sel=>document.querySelector(sel);
@@ -656,6 +941,28 @@ const grid=$("#grid"), countEl=$("#count"), pagesEl=$("#pages"), dl=$("#dl");
 const kind=$("#kind"), start=$("#start"), end=$("#end"), q=$("#q"), cat=$("#cat");
 const owner=$("#owner"), page=$("#page"), limit=$("#limit");
 const cP=$("#cP"), cA=$("#cA"), cN=$("#cN"), cO=$("#cO");
+
+// Modal refs
+const backdrop=$("#ticketBackdrop");
+const ticketImg=$("#ticketImg");
+const t_fecha_hora=$("#t_fecha_hora");
+const t_correlativo=$("#t_correlativo");
+const ticketForm=$("#ticketForm");
+const ticketClose=$("#ticketClose");
+const t_owner=$("#t_owner");
+const t_captura_date=$("#t_captura_date");
+const t_captura_name=$("#t_captura_name");
+const t_tipo_movimiento=$("#t_tipo_movimiento");
+const t_placa=$("#t_placa");
+const t_chofer_nombre=$("#t_chofer_nombre");
+const t_chofer_dni=$("#t_chofer_dni");
+const t_empresa_transporte=$("#t_empresa_transporte");
+const t_tipo_vehiculo=$("#t_tipo_vehiculo");
+const t_tipo_material=$("#t_tipo_material");
+const t_guia_remision=$("#t_guia_remision");
+const t_observaciones=$("#t_observaciones");
+
+let currentOwner="", currentDate="", currentName="";
 
 const cardId=url=>"i_"+btoa(url).replace(/=/g,"");
 
@@ -666,6 +973,10 @@ function ensureCard(it){
     const thumb=isImg?`<img loading="lazy" src="${it.url}" alt="${it.name}">`:`<div style="padding:20px;font-size:13px;opacity:.9">📄 ${it.name}</div>`;
     const delBtn = canDelete? `<button class="btn" data-del="${it.url}" data-owner="${it.owner}" data-kind="${it.kind}" data-date="${it.date}" data-name="${it.name}">🗑</button>` : "";
     el=document.createElement("div"); el.className="item"; el.id=id;
+    el.dataset.owner = it.owner;
+    el.dataset.kind  = it.kind;
+    el.dataset.date  = it.date;
+    el.dataset.name  = it.name;
     el.innerHTML=thumb+`<div class="meta"><span>${it.date} · ${it.cat}</span><div><a class="btn" target="_blank" href="${it.url}">Abrir</a> ${delBtn}</div></div>`;
     grid.appendChild(el); requestAnimationFrame(()=>el.classList.add("show"));
   }
@@ -674,7 +985,8 @@ function ensureCard(it){
 function bindDeletes(){
   if(!canDelete) return;
   grid.querySelectorAll("[data-del]").forEach(btn=>{
-    btn.onclick=async ()=>{
+    btn.onclick=async (ev)=>{
+      ev.stopPropagation();
       if(!confirm("¿Borrar este archivo?")) return;
       const qs=new URLSearchParams({
         owner: btn.dataset.owner,
@@ -719,11 +1031,111 @@ async function load(){
   diffRender(j.items||[]); applyCounts(j.counts||{});
   dl.href="/api/export.csv?"+buildParams().toString();
 }
+
+// Abrir modal al hacer clic en una captura
+grid.addEventListener("click", async (ev)=>{
+  const card = ev.target.closest(".item");
+  if(!card) return;
+  const ownerC = card.dataset.owner;
+  const kindC  = card.dataset.kind;
+  const dateC  = card.dataset.date;
+  const nameC  = card.dataset.name;
+  if(kindC !== "capturas") return; // solo capturas para tickets
+
+  const qs = new URLSearchParams({ owner: ownerC, kind: kindC, day: dateC, name: nameC });
+  const r = await fetch("/api/capture_detail?"+qs.toString());
+  if(!r.ok){
+    alert("No se pudo cargar detalle de la captura");
+    return;
+  }
+  const j = await r.json();
+
+  currentOwner = ownerC;
+  currentDate  = dateC;
+  currentName  = nameC;
+
+  ticketImg.src = j.url;
+  t_fecha_hora.textContent = j.fecha_hora || (dateC);
+  t_owner.value = currentOwner;
+  t_captura_date.value = currentDate;
+  t_captura_name.value = currentName;
+
+  const t = j.ticket || {};
+  if(t.has_ticket){
+    t_correlativo.textContent = t.correlativo_dia || "-";
+    t_tipo_movimiento.value   = t.tipo_movimiento || "ENTRADA";
+    t_placa.value             = t.placa || "";
+    t_chofer_nombre.value     = t.chofer_nombre || "";
+    t_chofer_dni.value        = t.chofer_dni || "";
+    t_empresa_transporte.value= t.empresa_transporte || "";
+    t_tipo_vehiculo.value     = t.tipo_vehiculo || "";
+    t_tipo_material.value     = t.tipo_material || "";
+    t_guia_remision.value     = t.guia_remision || "";
+    t_observaciones.value     = t.observaciones || "";
+  } else {
+    t_correlativo.textContent = "-";
+    t_tipo_movimiento.value   = "ENTRADA";
+    t_placa.value             = "";
+    t_chofer_nombre.value     = "";
+    t_chofer_dni.value        = "";
+    t_empresa_transporte.value= "";
+    t_tipo_vehiculo.value     = "";
+    t_tipo_material.value     = "";
+    t_guia_remision.value     = "";
+    t_observaciones.value     = "";
+  }
+
+  backdrop.classList.remove("hidden");
+});
+
+// Cerrar modal
+ticketClose.addEventListener("click", ()=>{ backdrop.classList.add("hidden"); });
+backdrop.addEventListener("click", (ev)=>{
+  if(ev.target === backdrop){ backdrop.classList.add("hidden"); }
+});
+
+// Guardar ticket
+ticketForm.addEventListener("submit", async (ev)=>{
+  ev.preventDefault();
+  if(!currentOwner || !currentDate || !currentName){
+    alert("Falta información de la captura");
+    return;
+  }
+  const data = new URLSearchParams();
+  data.set("owner", currentOwner);
+  data.set("captura_date", currentDate);
+  data.set("captura_name", currentName);
+  data.set("tipo_movimiento", t_tipo_movimiento.value);
+  data.set("placa", t_placa.value);
+  data.set("chofer_nombre", t_chofer_nombre.value);
+  data.set("chofer_dni", t_chofer_dni.value);
+  data.set("empresa_transporte", t_empresa_transporte.value);
+  data.set("tipo_vehiculo", t_tipo_vehiculo.value);
+  data.set("tipo_material", t_tipo_material.value);
+  data.set("guia_remision", t_guia_remision.value);
+  data.set("observaciones", t_observaciones.value);
+
+  const r = await fetch("/api/ticket", {
+    method: "POST",
+    body: data
+  });
+  if(!r.ok){
+    const tx = await r.text();
+    alert("Error al guardar ticket: " + tx);
+    return;
+  }
+  const j = await r.json();
+  t_correlativo.textContent = j.correlativo_dia || "-";
+  alert("Ticket guardado (N° " + (j.correlativo_dia||"?") + ")");
+  backdrop.classList.add("hidden");
+});
+
 async function boot(){
   const me=await fetch("/me"); if(me.status==401){ location.href="/login"; return; }
   const info=await me.json(); canDelete=(info.role==="admin");
   myRole=info.role; myUser=info.user;
-  document.querySelector("#who")?.remove(); // solo para coherencia
+  const whoEl = document.querySelector("#who");
+  if(whoEl){ whoEl.textContent = "· " + myUser + " (" + myRole + ")"; }
   if(myRole!=="admin"){ owner.value=myUser; owner.disabled=true; }
   load();
 }
