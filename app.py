@@ -7,16 +7,21 @@
 # Variables de entorno recomendadas (Render):
 #   SECRET_KEY       = <cadena larga aleatoria>
 #   USERS            = "admin:admin123:admin,cliente1:1234:cliente"   # usuario:pass:rol
-#   ORBET_TOKEN      = "ORBET_2025_Seguridad_ARES"
+#   ORBET_TOKEN      = "ORBET_2025_Seguridad_ARES"                    # token global (opcional)
+#   ORBET_TOKENS     = "admin:AAA111,cliente1:BBB222,cliente2:CCC333" # tokens por owner (opcional)
 #   DATA_DIR         = "data"
 #   RETENTION_DAYS   = "0"   # 0 = sin limpieza, o días a retener
 #
 # Subida desde ORBET local:
 #   POST /upload (multipart/form-data)
-#     token=ORBET_TOKEN
+#     token=<token del cliente>  (si ORBET_TOKENS está definido, se valida contra owner)
 #     kind=captura|ticket
-#     owner=<usuario destino>  (opcional; por defecto "admin")
+#     owner=<usuario destino>  (por ejemplo: mercado1, empresaX)
 #     file=@archivo.jpg
+#
+# NOTA:
+# - Si ORBET_TOKENS está definido, se usa para validar token+owner.
+# - Si ORBET_TOKENS está vacío, se usa ORBET_TOKEN global como antes.
 
 import os, io, csv, time, shutil
 from pathlib import Path
@@ -46,6 +51,17 @@ for pair in [p.strip() for p in USERS_ENV.split(",") if p.strip()]:
         if role not in ("admin", "cliente"):
             role = "admin"
         USERS[u] = {"password": p, "role": role}
+
+# Tokens por owner (multi-cliente)
+ORBET_TOKENS_ENV = os.getenv("ORBET_TOKENS", "").strip()
+TOKENS: Dict[str, str] = {}
+if ORBET_TOKENS_ENV:
+    for pair in [p.strip() for p in ORBET_TOKENS_ENV.split(",") if p.strip()]:
+        parts = pair.split(":")
+        if len(parts) >= 2:
+            owner_name = parts[0].strip()
+            tok = parts[1].strip()
+            TOKENS[owner_name] = tok
 
 # -------------------- Utils & FS --------------------
 def ensure_base_dirs():
@@ -153,6 +169,22 @@ def list_items(owner: str, kind: str, start: Optional[date], end: Optional[date]
             })
     return items
 
+# -------------------- Token validation --------------------
+def _validate_token(owner: str, token: str):
+    """
+    Valida el token recibido desde ORBET local.
+    - Si TOKENS (ORBET_TOKENS) está definido, exige que el token coincida con el del owner.
+    - Si TOKENS está vacío, usa ORBET_TOKEN global (compatibilidad con versiones anteriores).
+    """
+    owner = owner.strip()
+    if TOKENS:  # modo multi-cliente por owner
+        expected = TOKENS.get(owner)
+        if not expected or expected != token:
+            raise HTTPException(status_code=401, detail="Token inválido para este owner")
+    else:       # modo global antiguo
+        if token != ORBET_TOKEN:
+            raise HTTPException(status_code=401, detail="Token inválido")
+
 # -------------------- App & Auth --------------------
 app = FastAPI(title=APP_NAME)
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=60*60*12)  # 12h
@@ -248,8 +280,9 @@ async def upload(
     owner: str = Form("admin"),  # nombre de usuario destino => carpeta
     background: BackgroundTasks = None,
 ):
-    if token != ORBET_TOKEN:
-        raise HTTPException(status_code=401, detail="Token inválido")
+    # Validar token según owner
+    _validate_token(owner, token)
+
     if kind not in ("captura", "ticket"):
         raise HTTPException(status_code=400, detail="kind debe ser 'captura' o 'ticket'")
 
@@ -474,7 +507,7 @@ const cardId=url=>"i_"+btoa(url).replace(/=/g,"");
 function ensureCard(it){
   const id=cardId(it.url); let el=document.getElementById(id);
   if(!el){
-    const isImg=/\\.(jpg|jpeg|png|gif|webp)$/i.test(it.name);
+    const isImg=/\.(jpg|jpeg|png|gif|webp)$/i.test(it.name);
     const thumb=isImg?`<img loading="lazy" src="${it.url}" alt="${it.name}">`:`<div style="padding:20px;font-size:13px;opacity:.9">📄 ${it.name}</div>`;
     const delBtn = canDelete? `<button class="btn" data-del="${it.url}" data-owner="${it.owner}" data-kind="${it.kind}" data-date="${it.date}" data-name="${it.name}">🗑</button>` : "";
     el=document.createElement("div"); el.className="item"; el.id=id;
@@ -629,7 +662,7 @@ const cardId=url=>"i_"+btoa(url).replace(/=/g,"");
 function ensureCard(it){
   const id=cardId(it.url); let el=document.getElementById(id);
   if(!el){
-    const isImg=/\\.(jpg|jpeg|png|gif|webp)$/i.test(it.name);
+    const isImg=/\.(jpg|jpeg|png|gif|webp)$/i.test(it.name);
     const thumb=isImg?`<img loading="lazy" src="${it.url}" alt="${it.name}">`:`<div style="padding:20px;font-size:13px;opacity:.9">📄 ${it.name}</div>`;
     const delBtn = canDelete? `<button class="btn" data-del="${it.url}" data-owner="${it.owner}" data-kind="${it.kind}" data-date="${it.date}" data-name="${it.name}">🗑</button>` : "";
     el=document.createElement("div"); el.className="item"; el.id=id;
@@ -690,7 +723,7 @@ async function boot(){
   const me=await fetch("/me"); if(me.status==401){ location.href="/login"; return; }
   const info=await me.json(); canDelete=(info.role==="admin");
   myRole=info.role; myUser=info.user;
-  document.querySelector("#who")?.remove(); // (solo para coherencia si reusamos estilos)
+  document.querySelector("#who")?.remove(); // solo para coherencia
   if(myRole!=="admin"){ owner.value=myUser; owner.disabled=true; }
   load();
 }
